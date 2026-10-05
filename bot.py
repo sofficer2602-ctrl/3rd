@@ -228,6 +228,7 @@ async def run_bot():
     crash_count = 0
     first_run = True
     visited_numbers = set()  # Track which numbers we already clicked this cycle
+    summary_state = {}       # Track the exact text of each summary row to detect changes
     loop_count = 0
 
     while True:
@@ -271,13 +272,20 @@ async def run_bot():
                 cols = row.locator('td')
                 if await cols.count() < 5:
                     continue
+                
+                row_text = (await row.inner_text()).strip()
                 num = (await cols.nth(0).inner_text()).strip()
                 num_digits = re.sub(r'\D', '', num)
-                summary_numbers.append((i, num, num_digits))
+                summary_numbers.append((i, num, num_digits, row_text))
 
             visited_numbers.clear()
 
-            for idx, num, num_digits in summary_numbers:
+            for idx, num, num_digits, row_text in summary_numbers:
+                # ⚡ OPTIMIZATION: If the row text (including total SMS count) hasn't changed, skip clicking!
+                if summary_state.get(num_digits) == row_text:
+                    continue
+                summary_state[num_digits] = row_text
+
                 # SKIP if we already visited this number in this cycle
                 if num_digits in visited_numbers:
                     continue
