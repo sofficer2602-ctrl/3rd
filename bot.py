@@ -10,7 +10,7 @@ from telegram.ext import Application
 from playwright.async_api import async_playwright
 
 # ========== VERSION — check logs to confirm which code is running ==========
-VERSION = "v3.0"
+VERSION = "v3.1"
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "8885622806:AAEzNbdnJJWd5AGC6pC8LUBcOs2SRzKXlds")
 CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")
@@ -48,7 +48,6 @@ def make_dedup_key(ph, sender, msg_text):
     # Extract ALL 4-8 digit numbers from message to use as fingerprint
     all_codes = re.findall(r'\b(\d{4,8})\b', str(msg_text))
     codes_str = "|".join(sorted(all_codes)) if all_codes else ""
-    # Use sender + phone + codes as the unique fingerprint
     raw = f"{digits_ph}:{sender}:{codes_str}"
     return hashlib.md5(raw.encode()).hexdigest()
 
@@ -186,22 +185,51 @@ async def save_cookies():
 
 async def do_login():
     try:
-        print("🔐 Logging in...", flush=True)
+        print("🔐 Checking login...", flush=True)
+        # 1. Pehle check karo agar pehle se login session chal raha hai
+        try:
+            content = await page.content()
+            if 'Please enter your login details' not in content and ('Signoff' in content or "Today's figures" in content):
+                print("✅ Already logged in!", flush=True)
+                return True
+        except: pass
+
+        print("🔐 Navigating to login...", flush=True)
         await page.goto(LOGIN_URL, timeout=25000, wait_until='domcontentloaded')
         await asyncio.sleep(0.8)
+
+        # Check if cookies auto-logged in
+        content = await page.content()
+        if 'Please enter your login details' not in content and ('Signoff' in content or "Today's figures" in content):
+            print("✅ Auto-logged in via cookies!", flush=True)
+            return True
+
         u = page.locator('input[type="text"]').first
-        await u.click(); await u.fill(PANEL_USER)
-        await asyncio.sleep(0.2)
-        p = page.locator('input[type="password"]').first
-        await p.click(); await p.fill(PANEL_PASS)
-        await asyncio.sleep(0.2)
-        await page.locator('button, input[type="submit"]').first.click()
-        await asyncio.sleep(1.5)
-        await save_cookies()
-        print("✅ Login OK", flush=True)
-        return True
+        if await u.count() == 0:
+            u = page.locator('input[name="user"], input[name="username"], input[name="login"]').first
+
+        if await u.count() > 0:
+            await u.click(timeout=6000)
+            await u.fill(PANEL_USER)
+            await asyncio.sleep(0.2)
+            p = page.locator('input[type="password"]').first
+            await p.click(timeout=6000)
+            await p.fill(PANEL_PASS)
+            await asyncio.sleep(0.2)
+            await page.locator('button, input[type="submit"]').first.click(timeout=6000)
+            await asyncio.sleep(2.0)
+            await save_cookies()
+            print("✅ Login OK", flush=True)
+            return True
+        else:
+            content = await page.content()
+            if 'Signoff' in content:
+                print("✅ Logged in!", flush=True)
+                return True
+            print("⚠️ Login input not found", flush=True)
+            return False
     except Exception as e:
-        print(f"❌ Login failed: {e}", flush=True)
+        print(f"❌ Login note: {e}", flush=True)
         return False
 
 # ========== MAIN LOOP ==========
@@ -227,8 +255,8 @@ async def run_bot():
     err_count = 0
     crash_count = 0
     first_run = True
-    visited_numbers = set()  # Track which numbers we already clicked this cycle
-    summary_state = {}       # Track the exact text of each summary row to detect changes
+    visited_numbers = set()
+    summary_state = {}
     loop_count = 0
 
     while True:
@@ -261,6 +289,15 @@ async def run_bot():
                     continue
                 await page.goto(OTP_SUMMARY_URL, timeout=20000, wait_until='domcontentloaded')
 
+            if "security verification" in content or "Just a moment..." in content:
+                print("🛡️ Cloudflare detected! Trying to bypass...", flush=True)
+                try:
+                    cf_iframe = page.frame_locator('iframe[src*="challenges"]')
+                    if await cf_iframe.locator('.ctp-checkbox-label').count() > 0:
+                        await cf_iframe.locator('.ctp-checkbox-label').click(timeout=5000)
+                    await asyncio.sleep(8)
+                except: pass
+
             rows = page.locator('table tbody tr')
             total = await rows.count()
             print(f"📊 {total} rows", flush=True)
@@ -270,107 +307,173 @@ async def run_bot():
             for i in range(total):
                 row = rows.nth(i)
                 cols = row.locator('td')
-                if await cols.count() < 5:
+                if await cols.count() < 4:
                     continue
-                
+
                 row_text = (await row.inner_text()).strip()
                 num = (await cols.nth(0).inner_text()).strip()
                 num_digits = re.sub(r'\D', '', num)
-                summary_numbers.append((i, num, num_digits, row_text))
+                sender = (await cols.nth(1).inner_text()).strip() if await cols.count() > 1 else ""
+                summary_numbers.append((i, num, num_digits, sender, row_text))
 
             visited_numbers.clear()
 
-            for idx, num, num_digits, row_text in summary_numbers:
-                # ⚡ OPTIMIZATION: If the row text (including total SMS count) hasn't changed, skip clicking!
+            for idx, num, num_digits, summary_sender, row_text in summary_numbers:
+                # ⚡ OPTIMIZATION: If row text (including total SMS count) hasn't changed, skip clicking!
                 if summary_state.get(num_digits) == row_text:
                     continue
-                summary_state[num_digits] = row_text
 
                 # SKIP if we already visited this number in this cycle
                 if num_digits in visited_numbers:
                     continue
                 visited_numbers.add(num_digits)
 
-                # Re-locate rows fresh each time (page might have changed after go_back)
+                # Re-locate rows fresh each time
                 rows = page.locator('table tbody tr')
                 if idx >= await rows.count():
                     continue
                 row = rows.nth(idx)
-
-                form = row.locator('form').first
-                clicked = False
-                if await form.count() > 0:
-                    try: await form.click(); clicked = True
-                    except: pass
-                if not clicked:
-                    btn = row.locator('button:has-text("Select"), input[value*="Select"]').first
-                    if await btn.count() > 0:
-                        try: await btn.click(); clicked = True
-                        except: pass
-                if not clicked:
+                cols = row.locator('td')
+                if await cols.count() < 4:
                     continue
 
+                details_cell = cols.nth(-1)
+                clicked = False
+
+                # 1. Pehle form check karo aur form button ya submit evaluate karo
+                form = details_cell.locator('form').first
+                if await form.count() > 0:
+                    try:
+                        form_btn = form.locator('button, input[type="submit"], input[type="button"], a').first
+                        if await form_btn.count() > 0:
+                            await form_btn.click(timeout=4000)
+                            clicked = True
+                        else:
+                            await form.evaluate("f => f.submit()")
+                            clicked = True
+                    except Exception as e:
+                        print(f"Form submit note: {e}", flush=True)
+
+                # 2. Agar form nahi tha ya click nahi hua, direct button/link/input try karo
+                if not clicked:
+                    btn = details_cell.locator('button, a, input[type="submit"], input[value*="Select"], [onclick]').first
+                    if await btn.count() > 0:
+                        try:
+                            await btn.click(timeout=4000)
+                            clicked = True
+                        except Exception as e:
+                            print(f"Btn click note: {e}", flush=True)
+
+                # 3. Last resort: cell ko directly click karo
+                if not clicked:
+                    try:
+                        await details_cell.click(timeout=4000)
+                        clicked = True
+                    except: pass
+
+                if not clicked:
+                    print(f"⚠️ Could not click details for {num}, will retry", flush=True)
+                    continue
+
+                # DETAIL SCRAPING
+                scraped_ok = False
                 try:
                     await page.wait_for_load_state('domcontentloaded', timeout=8000)
+                    await asyncio.sleep(0.5)
+
                     detail_rows = page.locator('table tbody tr')
+                    detail_count = await detail_rows.count()
                     new_count = 0
-                    for j in range(await detail_rows.count()):
+
+                    for j in range(detail_count):
                         dcols = detail_rows.nth(j).locator('td')
-                        if await dcols.count() >= 5:
-                            dt = (await dcols.nth(0).inner_text()).strip()
-                            ph = (await dcols.nth(1).inner_text()).strip()
-                            se = (await dcols.nth(2).inner_text()).strip()
+                        col_count = await dcols.count()
+                        if col_count >= 4:
+                            # Last col is message body
                             ms = (await dcols.nth(-1).inner_text()).strip()
-                            if ms and len(ms) > 3 and dt:
-                                # BULLETPROOF dedup key — immune to timestamp changes
-                                key = make_dedup_key(ph, se, ms)
 
-                                if key not in seen_messages:
-                                    seen_messages[key] = True
+                            # Summary row ka Select button agar table mein hai toh skip karo
+                            if ms.lower() in ['select', 'details', 'action', '']:
+                                continue
+                            if not ms or len(ms) < 4:
+                                continue
 
-                                    if first_run:
-                                        continue
+                            dt = (await dcols.nth(0).inner_text()).strip()
 
-                                    new_count += 1
-                                    otp = extract_otp(ms)
-                                    masked = mask(ph)
+                            # Phone number detect karo (Receiver col 3, col 1 ya fallback to summary num)
+                            ph = ""
+                            for c_idx in [3, 1, 0]:
+                                if c_idx < col_count:
+                                    val = (await dcols.nth(c_idx).inner_text()).strip()
+                                    if re.search(r'\+?\d{8,}', val):
+                                        ph = val
+                                        break
+                            if not ph:
+                                ph = num
 
-                                    flag, ccode = get_country(ph)
-                                    clean_masked = escape_markdown(masked)
-                                    clean_ccode = escape_markdown(ccode)
-                                    line1 = f"{flag} {clean_ccode} \\| 🟢 {clean_masked} \\#EN"
+                            # Sender detect karo
+                            se = (await dcols.nth(2).inner_text()).strip() if col_count > 2 else ""
+                            if not se or se == ph or len(se) < 2:
+                                se = summary_sender or "SMS"
 
-                                    clean_sender = escape_markdown(se)
-                                    if otp and otp != "N/A":
-                                        clean_otp = escape_markdown(otp)
-                                        line2 = f"🔥 {clean_sender} \\- `{clean_otp}`"
-                                    else:
-                                        line2 = f"🔥 {clean_sender} \\- SMS Received"
+                            # Dedup key
+                            key = make_dedup_key(ph, se, ms)
 
-                                    message_text = f"{line1}\n{line2}"
+                            if key not in seen_messages:
+                                seen_messages[key] = True
 
-                                    if otp and otp != "N/A":
-                                        otp_btn = InlineKeyboardButton(f"🛡️ {otp}", api_kwargs={'copy_text': {'text': str(otp)}})
-                                    else:
-                                        otp_btn = InlineKeyboardButton("🛡️ SMS", callback_data="ignore")
-                                    keyboard = [
-                                        [InlineKeyboardButton("🔔 Channel", url=CHANNEL_URL), otp_btn],
-                                        [InlineKeyboardButton("📞 Get Number", url=GET_NUMBER_URL)]
-                                    ]
-                                    reply_markup = InlineKeyboardMarkup(keyboard)
+                                # Agar bot start hote hi > 5 purane messages hain toh skip karo taaki flood na ho
+                                # Lekin 1-2 test messages hon toh turant forward karo!
+                                if first_run and total > 5:
+                                    continue
 
-                                    await send_to_all_channels(message_text, reply_markup)
-                                    print(f"✅ SENT: {masked} | {otp} [key={key[:8]}]", flush=True)
+                                new_count += 1
+                                otp = extract_otp(ms)
+                                masked = mask(ph)
+
+                                flag, ccode = get_country(ph)
+                                clean_masked = escape_markdown(masked)
+                                clean_ccode = escape_markdown(ccode)
+                                line1 = f"{flag} {clean_ccode} \\| 🟢 {clean_masked} \\#EN"
+
+                                clean_sender = escape_markdown(se)
+                                if otp and otp != "N/A":
+                                    clean_otp = escape_markdown(otp)
+                                    line2 = f"🔥 {clean_sender} \\- `{clean_otp}`"
+                                else:
+                                    line2 = f"🔥 {clean_sender} \\- SMS Received"
+
+                                message_text = f"{line1}\n{line2}"
+
+                                if otp and otp != "N/A":
+                                    otp_btn = InlineKeyboardButton(f"🛡️ {otp}", api_kwargs={'copy_text': {'text': str(otp)}})
+                                else:
+                                    otp_btn = InlineKeyboardButton("🛡️ SMS", callback_data="ignore")
+                                keyboard = [
+                                    [InlineKeyboardButton("🔔 Channel", url=CHANNEL_URL), otp_btn],
+                                    [InlineKeyboardButton("📞 Get Number", url=GET_NUMBER_URL)]
+                                ]
+                                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                                await send_to_all_channels(message_text, reply_markup)
+                                print(f"✅ SENT: {masked} | {otp} [key={key[:8]}]", flush=True)
 
                     if new_count > 0:
                         save_seen(seen_messages)
 
-                    # Go back to summary — use goto instead of go_back for reliability
+                    scraped_ok = True
+
+                    # Summary page par wapis jao
                     await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
+
                 except Exception as e:
                     print(f"Detail err: {e}", flush=True)
                     try: await page.goto(OTP_SUMMARY_URL, timeout=15000, wait_until='domcontentloaded')
                     except: pass
+
+                # SUCCESS: State cache tabhi update hoga jab detail open hoke scan ho gaya ho!
+                if scraped_ok:
+                    summary_state[num_digits] = row_text
 
             if first_run:
                 first_run = False
@@ -415,16 +518,16 @@ def start_simple_server():
     import socketserver
     import os
     port = int(os.getenv('PORT', 8080))
-    
+
     class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"OK")
-            
+
         def log_message(self, format, *args):
-            pass # Disable logging to keep console clean
+            pass
 
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
@@ -432,7 +535,6 @@ def start_simple_server():
         httpd.serve_forever()
 
 async def web_server():
-    # Run simple server in a separate thread so it doesn't block asyncio
     await asyncio.to_thread(start_simple_server)
 
 async def main():
@@ -448,9 +550,7 @@ async def main():
 
     print(f"✅ Bot {VERSION} SEND-ONLY mode", flush=True)
 
-    # Start the background web server for Render health checks
     asyncio.create_task(web_server())
-
     asyncio.create_task(run_bot())
     await asyncio.Event().wait()
 
