@@ -10,7 +10,7 @@ from telegram.ext import Application
 import aiohttp
 
 # ========== VERSION — check logs to confirm which code is running ==========
-VERSION = "v4.1 - Smart Fast Engine"
+VERSION = "v4.3 - Rock Solid Engine"
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "8885622806:AAEzNbdnJJWd5AGC6pC8LUBcOs2SRzKXlds")
 CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")
@@ -33,31 +33,45 @@ bot_ref = None
 last_alert_time = 0
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 
-# Summary row pattern: NUMBER, SENDER, MSG_COUNT, RANGE, then form with ddi+oad
-# Example: <td>+59161156915</td><td>Dola</td><td>1</td><td>BOLIVIA</td><td><form...ddi=+59161156915...oad=Dola...></td>
-summary_row_pattern = re.compile(
-    r'<tr[^>]*class=table_line_[^>]*>'
-    r'.*?<td[^>]*>(.*?)</td>'    # NUMBER
-    r'.*?<td[^>]*>(.*?)</td>'    # SENDER
-    r'.*?<td[^>]*>(.*?)</td>'    # MSG COUNT
-    r'.*?<td[^>]*>(.*?)</td>'    # RANGE
-    r'.*?name=ddi\s+value=([^\s>]+).*?name=oad\s+value=([^\s>]+)',
-    re.DOTALL | re.IGNORECASE
-)
+# ========== FAST HTML PARSERS (1-2ms, 0 Backtracking) ==========
+def parse_summary_fast(html):
+    rows = []
+    # Match each row block cleanly without backtracking
+    row_blocks = re.findall(r'<tr[^>]*class=table_line_[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+    for tr in row_blocks:
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
+        if len(tds) >= 4:
+            num = re.sub(r'<[^>]+>', '', tds[0]).strip()
+            sender = re.sub(r'<[^>]+>', '', tds[1]).strip()
+            count = re.sub(r'<[^>]+>', '', tds[2]).strip()
+            rng = re.sub(r'<[^>]+>', '', tds[3]).strip()
 
-msg_pattern = re.compile(
-    r'<tr[^>]*class=table_line_[^>]*>'
-    r'.*?<td[^>]*>(.*?)</td>'    # DATE TIME
-    r'.*?<td[^>]*>(.*?)</td>'    # LONGCODE (phone)
-    r'.*?<td[^>]*>(.*?)</td>'    # SENDER
-    r'.*?<td[^>]*>(.*?)</td>'    # RANGE
-    r'.*?<td[^>]*>(.*?)</td>'    # STATUS
-    r'.*?<td[^>]*>(.*?)</td>',   # MESSAGE BODY
-    re.DOTALL | re.IGNORECASE
-)
+            ddi_m = re.search(r'name=ddi\s+value=([^\s>]+)', tr, re.IGNORECASE)
+            oad_m = re.search(r'name=oad\s+value=([^\s>]+)', tr, re.IGNORECASE)
+            ddi = ddi_m.group(1).strip() if ddi_m else num
+            oad = oad_m.group(1).strip() if oad_m else sender
+
+            rows.append((num, sender, count, rng, ddi, oad))
+    return rows
+
+def parse_detail_fast(html):
+    messages = []
+    row_blocks = re.findall(r'<tr[^>]*class=table_line_[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+    for tr in row_blocks:
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
+        if len(tds) >= 6:
+            dt = re.sub(r'<[^>]+>', '', tds[0]).strip()
+            ph = re.sub(r'<[^>]+>', '', tds[1]).strip()
+            se = re.sub(r'<[^>]+>', '', tds[2]).strip()
+            rg = re.sub(r'<[^>]+>', '', tds[3]).strip()
+            st = re.sub(r'<[^>]+>', '', tds[4]).strip()
+            ms = re.sub(r'<[^>]+>', '', tds[5]).strip()
+            messages.append((dt, ph, se, rg, st, ms))
+    return messages
 
 # ========== BULLETPROOF DEDUP ==========
 def make_dedup_key(ph, sender, msg_text):
@@ -98,32 +112,48 @@ def get_country(ph):
     try:
         import phonenumbers
         p = phonenumbers.parse("+" + str(ph).lstrip("+"))
-        cc = "+" + str(p.country_code)
-        region = phonenumbers.region_code_for_number(p)
-        if region:
-            return region_to_flag(region), cc
+        r = phonenumbers.region_code_for_number(p)
+        if r and len(r) == 2:
+            return region_to_flag(r), r
     except:
         pass
-    return "🌐", "+???"
+    return "🌍", "GLOBAL"
 
 async def safe_send(bot, chat_id, text, reply_markup=None):
-    try:
-        if reply_markup:
-            await bot.send_message(chat_id, text, parse_mode="MarkdownV2", reply_markup=reply_markup, read_timeout=10, write_timeout=10)
-        else:
-            await bot.send_message(chat_id, text, parse_mode="Markdown", read_timeout=10, write_timeout=10)
-        return True
-    except Exception as e:
-        print(f"Send err [{chat_id}]: {e}", flush=True)
-        return False
+    for attempt in range(3):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="MarkdownV2",
+                reply_markup=reply_markup,
+                read_timeout=15,
+                write_timeout=15,
+                connect_timeout=15
+            )
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "Flood control exceeded" in err_str or "Too Many Requests" in err_str:
+                wait_sec = 5
+                m = re.search(r'retry after (\d+)', err_str, re.IGNORECASE)
+                if m:
+                    wait_sec = int(m.group(1)) + 1
+                print(f"⏳ Telegram Flood wait {wait_sec}s for {chat_id}", flush=True)
+                await asyncio.sleep(wait_sec)
+                continue
+            if attempt < 2:
+                await asyncio.sleep(1)
+            else:
+                print(f"Send err [{chat_id}]: {e}", flush=True)
+                return False
+    return False
 
-async def send_to_all_channels(text, reply_markup):
-    tasks = [
-        safe_send(bot_ref, CHANNEL_ID, text, reply_markup),
-        safe_send(bot_ref, NEW_CHANNEL_ID, text, reply_markup),
-        safe_send(bot_ref, PRIVATE_CHANNEL_ID, text, reply_markup),
-    ]
-    await asyncio.gather(*tasks)
+async def send_to_all_channels(text, reply_markup=None):
+    for cid in [CHANNEL_ID, NEW_CHANNEL_ID, PRIVATE_CHANNEL_ID]:
+        if cid:
+            await safe_send(bot_ref, cid, text, reply_markup)
+            await asyncio.sleep(0.15)  # Safe delay between channels to avoid rate limit
 
 async def admin_alert(bot, text):
     global last_alert_time
@@ -149,7 +179,7 @@ async def do_login(session):
             "user": PANEL_USER,
             "password": PANEL_PASS
         }
-        async with session.post(LOGIN_URL, data=data, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with session.post(LOGIN_URL, data=data, timeout=aiohttp.ClientTimeout(total=15, connect=8)) as r:
             text = await r.text()
             if "Please enter your login details" not in text:
                 print("✅ Login Successful!", flush=True)
@@ -158,7 +188,7 @@ async def do_login(session):
                 print("❌ Login Failed - check credentials", flush=True)
                 return False
     except Exception as e:
-        print(f"❌ Login Error: {e}", flush=True)
+        print(f"❌ Login Error: {type(e).__name__} {e}", flush=True)
         return False
 
 # ========== MAIN SCRAPING LOOP ==========
@@ -170,8 +200,7 @@ async def run_bot():
 
     first_run = True
     err_count = 0
-    # Track message count per number+sender to detect changes
-    # Key: "ddi|oad" -> last known msg count
+    # Map of (ddi, oad) -> total aggregated message count
     last_msg_counts = {}
 
     conn = aiohttp.TCPConnector(limit=10, ssl=False)
@@ -182,7 +211,7 @@ async def run_bot():
         while True:
             try:
                 # 1. Fetch Summary Page (lightweight — just 1 request)
-                async with session.get(OTP_SUMMARY_URL, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                async with session.get(OTP_SUMMARY_URL, timeout=aiohttp.ClientTimeout(total=20, connect=8)) as r:
                     summary_html = await r.text()
 
                 # Check if session expired
@@ -193,52 +222,56 @@ async def run_bot():
                         continue
                     continue
 
-                # 2. Parse summary rows: extract NUMBER, SENDER, MSG_COUNT, ddi, oad
-                rows = summary_row_pattern.findall(summary_html)
+                # 2. Parse summary rows cleanly (<2ms)
+                rows = parse_summary_fast(summary_html)
                 total = len(rows)
-                print(f"📊 {total} numbers", flush=True)
 
                 if not rows:
+                    print("📊 0 numbers on panel", flush=True)
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # 3. Find which numbers have NEW messages (count changed or new number)
-                changed = []
+                # 3. AGGREGATE counts by unique (ddi, oad)
+                # Some numbers have 2+ rows on the panel for different batches (e.g. 20 + 2 = 22)
+                # Aggregating prevents duplicate-key flipping/infinite-loop!
+                current_counts = {}
+                for num, sender, count_str, rng, ddi, oad in rows:
+                    key = (ddi.strip(), oad.strip())
+                    try:
+                        c = int(count_str.strip())
+                    except:
+                        c = 1
+                    current_counts[key] = current_counts.get(key, 0) + c
+
+                print(f"📊 {total} rows ({len(current_counts)} unique numbers)", flush=True)
 
                 if first_run:
-                    # ⚡ FIRST RUN: Don't fetch any details! Just save current counts.
-                    # This makes boot INSTANT even with 500 numbers (0 detail requests)
-                    for number, sender, msg_count_str, rng, ddi, oad in rows:
-                        row_key = f"{ddi.strip()}|{oad.strip()}"
-                        last_msg_counts[row_key] = msg_count_str.strip()
+                    # ⚡ FIRST RUN: Save all current aggregated counts.
+                    # 0 detail fetches needed on startup! Boot is instant.
+                    last_msg_counts = current_counts.copy()
                     first_run = False
-                    print(f"🔒 First scan done — tracking {len(last_msg_counts)} numbers (0 detail fetches needed)", flush=True)
+                    print(f"🔒 First scan done — tracking {len(last_msg_counts)} unique numbers (0 detail fetches needed)", flush=True)
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                for number, sender, msg_count_str, rng, ddi, oad in rows:
-                    number = number.strip()
-                    sender = sender.strip()
-                    msg_count_str = msg_count_str.strip()
-                    ddi = ddi.strip()
-                    oad = oad.strip()
-                    row_key = f"{ddi}|{oad}"
-
-                    if last_msg_counts.get(row_key) != msg_count_str:
-                        # Message count changed! New SMS arrived for this number
-                        changed.append((ddi, oad, row_key, msg_count_str))
+                # 4. Find which unique numbers CHANGED or are NEW
+                changed = []
+                for (ddi, oad), total_cnt in current_counts.items():
+                    prev_cnt = last_msg_counts.get((ddi, oad))
+                    if prev_cnt != total_cnt:
+                        changed.append((ddi, oad, total_cnt))
 
                 if changed:
                     print(f"🔍 {len(changed)} numbers changed — fetching details...", flush=True)
 
-                    # 4. Fetch changed numbers in BATCHES of 5 (safe for 100+ numbers)
+                    # 5. Fetch changed numbers in BATCHES of 5
                     BATCH_SIZE = 5
 
                     async def fetch_one(ddi, oad):
                         try:
-                            async with session.post(DETAIL_URL, data={"ddi": ddi, "oad": oad}, timeout=aiohttp.ClientTimeout(total=12)) as r_det:
+                            async with session.post(DETAIL_URL, data={"ddi": ddi, "oad": oad}, timeout=aiohttp.ClientTimeout(total=15, connect=8)) as r_det:
                                 html = await r_det.text()
-                                matches = msg_pattern.findall(html)
+                                matches = parse_detail_fast(html)
                                 return ddi, oad, matches, True
                         except Exception as e:
                             print(f"⚠️ Fetch retry needed for {ddi}: {type(e).__name__}", flush=True)
@@ -247,18 +280,17 @@ async def run_bot():
                     results = []
                     for batch_start in range(0, len(changed), BATCH_SIZE):
                         batch = changed[batch_start:batch_start + BATCH_SIZE]
-                        batch_tasks = [fetch_one(ddi, oad) for ddi, oad, _, _ in batch]
+                        batch_tasks = [fetch_one(ddi, oad) for ddi, oad, _ in batch]
                         batch_results = await asyncio.gather(*batch_tasks)
                         results.extend(batch_results)
 
                     new_count = 0
                     for i, (ddi, oad, msgs, success) in enumerate(results):
-                        row_key = changed[i][2]
-                        msg_count_str = changed[i][3]
+                        new_total_cnt = changed[i][2]
 
-                        # Only update cache if fetch was successful
+                        # Only update count once detail was successfully fetched
                         if success:
-                            last_msg_counts[row_key] = msg_count_str
+                            last_msg_counts[(ddi, oad)] = new_total_cnt
 
                         for m in msgs:
                             dt, ph, se, rg, st, ms = [x.strip() for x in m]
@@ -275,9 +307,6 @@ async def run_bot():
 
                             if key not in seen_messages:
                                 seen_messages[key] = True
-
-                                if first_run and len(seen_messages) > 10:
-                                    continue
 
                                 new_count += 1
                                 otp = extract_otp(ms)
@@ -310,23 +339,14 @@ async def run_bot():
 
                                 await send_to_all_channels(message_text, reply_markup)
                                 print(f"✅ SENT: {masked} | {otp} [key={key[:8]}]", flush=True)
+                                # Safety throttle between messages to prevent Telegram rate limit
+                                await asyncio.sleep(0.3)
 
                     if new_count > 0:
                         save_seen(seen_messages)
                 else:
-                    # Also update counts for rows that haven't changed (keep cache fresh)
-                    for number, sender, msg_count_str, rng, ddi, oad in rows:
-                        row_key = f"{ddi.strip()}|{oad.strip()}"
-                        last_msg_counts[row_key] = msg_count_str.strip()
-
-                if first_run:
-                    first_run = False
-                    # On first run, mark all current counts
-                    for number, sender, msg_count_str, rng, ddi, oad in rows:
-                        row_key = f"{ddi.strip()}|{oad.strip()}"
-                        last_msg_counts[row_key] = msg_count_str.strip()
-                    save_seen(seen_messages)
-                    print(f"🔒 First scan done — {len(seen_messages)} msgs marked, tracking {len(last_msg_counts)} numbers", flush=True)
+                    # Sync any new or removed numbers to keep cache pristine
+                    last_msg_counts = current_counts.copy()
 
                 if len(seen_messages) > 1500:
                     keys_to_keep = list(seen_messages.keys())[-1000:]
@@ -336,9 +356,9 @@ async def run_bot():
 
             except Exception as e:
                 err_count += 1
-                print(f"Poll err ({err_count}/5): {e}", flush=True)
+                print(f"Poll err ({err_count}/5): {type(e).__name__} {e}", flush=True)
                 if err_count >= 5:
-                    await admin_alert(bot_ref, f"⚠️ Polling errors: {e}")
+                    await admin_alert(bot_ref, f"⚠️ Polling errors: {type(e).__name__} {e}")
                     err_count = 0
                     await asyncio.sleep(3)
 
