@@ -1,3 +1,11 @@
+import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except:
+        pass
+
 import asyncio
 import json
 import os
@@ -10,7 +18,7 @@ from telegram.ext import Application
 import aiohttp
 
 # ========== VERSION — check logs to confirm which code is running ==========
-VERSION = "v4.3 - Rock Solid Engine"
+VERSION = "v5.0 - 24/7 Bulletproof Engine"
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN", "8885622806:AAEzNbdnJJWd5AGC6pC8LUBcOs2SRzKXlds")
 CHANNEL_ID      = os.getenv("CHANNEL_ID", "-1004427004477")
@@ -85,14 +93,14 @@ def load_seen():
     try:
         with open(seen_file, 'r') as f:
             data = json.load(f)
-            return {k: True for k in data[-1000:]}
+            return {k: True for k in data[-1500:]}
     except:
         return {}
 
 def save_seen(seen):
     try:
         with open(seen_file, 'w') as f:
-            json.dump(list(seen.keys())[-1000:], f)
+            json.dump(list(seen.keys())[-1500:], f)
     except:
         pass
 
@@ -179,7 +187,7 @@ async def do_login(session):
             "user": PANEL_USER,
             "password": PANEL_PASS
         }
-        async with session.post(LOGIN_URL, data=data, timeout=aiohttp.ClientTimeout(total=15, connect=8)) as r:
+        async with session.post(LOGIN_URL, data=data, timeout=aiohttp.ClientTimeout(total=20, connect=10)) as r:
             text = await r.text()
             if "Please enter your login details" not in text:
                 print("✅ Login Successful!", flush=True)
@@ -196,10 +204,14 @@ async def run_bot():
     global seen_messages
 
     print(f"🚀 BOT {VERSION} STARTING...", flush=True)
-    await safe_send(bot_ref, ADMIN_ID, f"🚀 Bot {VERSION} started!")
+    await safe_send(bot_ref, ADMIN_ID, f"🚀 Bot {escape_markdown(VERSION)} started!")
 
     first_run = True
     err_count = 0
+    last_empty_log = 0
+    last_login_time = time.time()
+    last_date = datetime.now().strftime("%Y-%m-%d")
+
     # Map of (ddi, oad) -> total aggregated message count
     last_msg_counts = {}
 
@@ -210,30 +222,52 @@ async def run_bot():
 
         while True:
             try:
-                # 1. Fetch Summary Page (lightweight — just 1 request)
+                # 0. Midnight / Day Rollover Detection
+                today_date = datetime.now().strftime("%Y-%m-%d")
+                if today_date != last_date:
+                    print(f"🌅 New day started ({today_date}) — resetting message counts!", flush=True)
+                    last_date = today_date
+                    last_msg_counts.clear()
+
+                # 0b. Proactive Session Refresh (every 2 hours so session never dies)
+                if time.time() - last_login_time > 7200:
+                    print("🔄 Refreshing session (2-hour keepalive)...", flush=True)
+                    await do_login(session)
+                    last_login_time = time.time()
+
+                # 1. Fetch Summary Page
                 async with session.get(OTP_SUMMARY_URL, timeout=aiohttp.ClientTimeout(total=20, connect=8)) as r:
                     summary_html = await r.text()
 
-                # Check if session expired
-                if "Please enter your login details" in summary_html:
-                    print("🔄 Session expired — re-logging in...", flush=True)
+                # Check if session is truly valid
+                is_logged_in = ("Today" in summary_html or "main-panel" in summary_html) and ("Please enter your login details" not in summary_html)
+                if not is_logged_in:
+                    print("🔄 Session expired/invalid — re-logging in...", flush=True)
                     if not await do_login(session):
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(5)
                         continue
+                    last_login_time = time.time()
                     continue
 
-                # 2. Parse summary rows cleanly (<2ms)
+                # 2. Parse summary rows (<2ms)
                 rows = parse_summary_fast(summary_html)
                 total = len(rows)
 
+                # 3. Handle Empty Panel (Midnight reset or no SMS yet)
                 if not rows:
-                    print("📊 0 numbers on panel", flush=True)
+                    if last_msg_counts:
+                        print("🧹 Panel reset to 0 numbers — cleared count cache", flush=True)
+                        last_msg_counts.clear()
+
+                    now = time.time()
+                    if now - last_empty_log >= 30:
+                        print("📊 0 numbers on panel (waiting for incoming SMS...)", flush=True)
+                        last_empty_log = now
+
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # 3. AGGREGATE counts by unique (ddi, oad)
-                # Some numbers have 2+ rows on the panel for different batches (e.g. 20 + 2 = 22)
-                # Aggregating prevents duplicate-key flipping/infinite-loop!
+                # 4. AGGREGATE counts by unique (ddi, oad)
                 current_counts = {}
                 for num, sender, count_str, rng, ddi, oad in rows:
                     key = (ddi.strip(), oad.strip())
@@ -243,56 +277,55 @@ async def run_bot():
                         c = 1
                     current_counts[key] = current_counts.get(key, 0) + c
 
-                print(f"📊 {total} rows ({len(current_counts)} unique numbers)", flush=True)
+                # 5. Determine which numbers CHANGED or are NEW
+                changed = []
 
                 if first_run:
-                    # ⚡ FIRST RUN: Save all current aggregated counts.
-                    # 0 detail fetches needed on startup! Boot is instant.
-                    last_msg_counts = current_counts.copy()
                     first_run = False
-                    print(f"🔒 First scan done — tracking {len(last_msg_counts)} unique numbers (0 detail fetches needed)", flush=True)
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-
-                # 4. Find which unique numbers CHANGED or are NEW
-                changed = []
-                for (ddi, oad), total_cnt in current_counts.items():
-                    prev_cnt = last_msg_counts.get((ddi, oad))
-                    if prev_cnt != total_cnt:
-                        changed.append((ddi, oad, total_cnt))
+                    is_cold_start = (len(seen_messages) == 0)
+                    print(f"🚀 Initial boot: Found {len(current_counts)} active numbers on panel (cold_start={is_cold_start})", flush=True)
+                    # On startup, fetch details for current numbers so we NEVER miss recent test messages!
+                    for (ddi, oad), total_cnt in current_counts.items():
+                        changed.append((ddi, oad, total_cnt, is_cold_start))
+                else:
+                    for (ddi, oad), total_cnt in current_counts.items():
+                        prev_cnt = last_msg_counts.get((ddi, oad))
+                        if prev_cnt != total_cnt:
+                            changed.append((ddi, oad, total_cnt, False))
 
                 if changed:
                     print(f"🔍 {len(changed)} numbers changed — fetching details...", flush=True)
 
-                    # 5. Fetch changed numbers in BATCHES of 5
+                    # Fetch changed numbers in BATCHES of 5
                     BATCH_SIZE = 5
 
-                    async def fetch_one(ddi, oad):
+                    async def fetch_one(ddi, oad, total_cnt, cold_start):
                         try:
                             async with session.post(DETAIL_URL, data={"ddi": ddi, "oad": oad}, timeout=aiohttp.ClientTimeout(total=15, connect=8)) as r_det:
                                 html = await r_det.text()
                                 matches = parse_detail_fast(html)
-                                return ddi, oad, matches, True
+                                return ddi, oad, total_cnt, cold_start, matches, True
                         except Exception as e:
                             print(f"⚠️ Fetch retry needed for {ddi}: {type(e).__name__}", flush=True)
-                            return ddi, oad, [], False
+                            return ddi, oad, total_cnt, cold_start, [], False
 
                     results = []
                     for batch_start in range(0, len(changed), BATCH_SIZE):
                         batch = changed[batch_start:batch_start + BATCH_SIZE]
-                        batch_tasks = [fetch_one(ddi, oad) for ddi, oad, _ in batch]
+                        batch_tasks = [fetch_one(ddi, oad, cnt, cs) for ddi, oad, cnt, cs in batch]
                         batch_results = await asyncio.gather(*batch_tasks)
                         results.extend(batch_results)
 
                     new_count = 0
-                    for i, (ddi, oad, msgs, success) in enumerate(results):
-                        new_total_cnt = changed[i][2]
-
-                        # Only update count once detail was successfully fetched
+                    for ddi, oad, new_total_cnt, cold_start, msgs, success in results:
                         if success:
                             last_msg_counts[(ddi, oad)] = new_total_cnt
 
-                        for m in msgs:
+                        # If cold start (brand new deploy with 0 seen history), only take latest 1 message per number
+                        # to prevent flooding the channel with 50 old messages from earlier today.
+                        msgs_to_process = msgs[-1:] if (cold_start and len(msgs) > 1) else msgs
+
+                        for m in msgs_to_process:
                             dt, ph, se, rg, st, ms = [x.strip() for x in m]
 
                             if not ms or len(ms) < 4:
@@ -339,14 +372,22 @@ async def run_bot():
 
                                 await send_to_all_channels(message_text, reply_markup)
                                 print(f"✅ SENT: {masked} | {otp} [key={key[:8]}]", flush=True)
-                                # Safety throttle between messages to prevent Telegram rate limit
+                                # Throttle to avoid Telegram flood limits
                                 await asyncio.sleep(0.3)
+
+                        # Mark all remaining older messages as seen
+                        for m in msgs:
+                            dt, ph, se, rg, st, ms = [x.strip() for x in m]
+                            actual_phone = ph if re.search(r'\+?\d{8,}', ph) else ddi
+                            actual_sender = se if len(se) >= 2 else oad
+                            k = make_dedup_key(actual_phone, actual_sender, ms)
+                            seen_messages[k] = True
 
                     if new_count > 0:
                         save_seen(seen_messages)
                 else:
-                    # Sync any new or removed numbers to keep cache pristine
-                    last_msg_counts = current_counts.copy()
+                    # Prune numbers that are no longer on the panel
+                    last_msg_counts = {k: v for k, v in last_msg_counts.items() if k in current_counts}
 
                 if len(seen_messages) > 1500:
                     keys_to_keep = list(seen_messages.keys())[-1000:]
